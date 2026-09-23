@@ -2,6 +2,7 @@ package co.wethinkcode.healthsafe;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import co.wethinkcode.healthsafe.mq.MqConfig;
 import io.javalin.Javalin;
 import java.io.IOException;
 import java.net.URI;
@@ -11,6 +12,16 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.jms.Connection;
+import javax.jms.Message;
+import javax.jms.MessageConsumer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import org.apache.activemq.ActiveMQConnectionFactory;
 
 public class WardServiceApp {
     private static final String DEFAULT_INGESTION_URL = "http://localhost:7030";
@@ -18,6 +29,8 @@ public class WardServiceApp {
     public static void main(String[] args) {
         WardDirectoryClient directory = new WardDirectoryClient(
                 System.getenv().getOrDefault("INGESTION_SERVICE_URL", DEFAULT_INGESTION_URL));
+        StaffingEventSubscriber staffingEvents = new StaffingEventSubscriber();
+        staffingEvents.start();
         Javalin app = Javalin.create().start(7031);
 
         app.get("/health", ctx -> ctx.result("OK"));
@@ -52,6 +65,14 @@ public class WardServiceApp {
             } catch (DownstreamUnavailableException exception) {
                 unavailable(ctx, exception);
             }
+        });
+        app.get("/staffing-events/latest", ctx -> {
+            StaffingEvent event = staffingEvents.latest();
+            if (event == null) {
+                ctx.status(204);
+                return;
+            }
+            ctx.json(event);
         });
     }
 
@@ -123,4 +144,78 @@ public class WardServiceApp {
     }
 
     private static final class DownstreamUnavailableException extends Exception { }
+
+    private record StaffingEvent(String wardId, String department, int alertLevel,
+                                 int requiredDoctors, List<String> onCallRoles) { }
+
+    private static final class StaffingEventSubscriber {
+        private final AtomicReference<StaffingEvent> latest = new AtomicReference<>();
+        private final AtomicBoolean running = new AtomicBoolean(true);
+        private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "staffing-topic-subscriber");
+            thread.setDaemon(true);
+            return thread;
+        });
+        private final ObjectMapper objectMapper = new ObjectMapper();
+
+        private void start() {
+            worker.submit(this::consume);
+        }
+
+        private StaffingEvent latest() {
+            return latest.get();
+        }
+
+        private void consume() {
+            while (running.get()) {
+                Connection connection = null;
+                try {
+                    connection = new ActiveMQConnectionFactory(MqConfig.BROKER_URL).createConnection();
+                    connection.setClientID("ward-service");
+                    try (Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+                         MessageConsumer consumer = session.createDurableSubscriber(
+                                 session.createTopic(MqConfig.TOPIC), "ward-service-staffing-events")) {
+                        consumer.setMessageListener(this::store);
+                        connection.start();
+                        while (running.get()) {
+                            Thread.sleep(500);
+                        }
+                    }
+                } catch (Exception exception) {
+                    if (running.get()) {
+                        System.err.println("Waiting for staffing-events topic: " + exception.getMessage());
+                        pauseBeforeRetry();
+                    }
+                } finally {
+                    if (connection != null) {
+                        try {
+                            connection.close();
+                        } catch (Exception ignored) {
+                            // The broker connection is already unavailable.
+                        }
+                    }
+                }
+            }
+        }
+
+        private void store(Message message) {
+            if (!(message instanceof TextMessage textMessage)) {
+                return;
+            }
+            try {
+                latest.set(objectMapper.readValue(textMessage.getText(), StaffingEvent.class));
+            } catch (Exception exception) {
+                System.err.println("Ignoring invalid staffing event: " + exception.getMessage());
+            }
+        }
+
+        private void pauseBeforeRetry() {
+            try {
+                Thread.sleep(2_000);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                running.set(false);
+            }
+        }
+    }
 }

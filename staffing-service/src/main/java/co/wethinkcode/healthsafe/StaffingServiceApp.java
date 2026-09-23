@@ -1,6 +1,7 @@
 package co.wethinkcode.healthsafe;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import co.wethinkcode.healthsafe.mq.MqConfig;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import java.io.IOException;
@@ -13,6 +14,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import javax.jms.Connection;
+import javax.jms.DeliveryMode;
+import javax.jms.MessageProducer;
+import javax.jms.Session;
+import javax.jms.TextMessage;
+import org.apache.activemq.ActiveMQConnectionFactory;
 
 public class StaffingServiceApp {
     private static final String DEFAULT_WARD_SERVICE_URL = "http://localhost:7031";
@@ -22,6 +29,7 @@ public class StaffingServiceApp {
         HospitalClient hospital = new HospitalClient(
                 System.getenv().getOrDefault("WARD_SERVICE_URL", DEFAULT_WARD_SERVICE_URL),
                 System.getenv().getOrDefault("ALERT_LEVEL_SERVICE_URL", DEFAULT_ALERT_LEVEL_SERVICE_URL));
+        StaffingEventPublisher eventPublisher = new StaffingEventPublisher();
         Javalin app = Javalin.create().start(7033);
 
         app.get("/health", ctx -> ctx.result("OK"));
@@ -33,7 +41,9 @@ public class StaffingServiceApp {
                     return;
                 }
                 AlertLevel alertLevel = hospital.alertLevel();
-                ctx.json(Schedule.create(ward, alertLevel.level()));
+                Schedule schedule = Schedule.create(ward, alertLevel.level());
+                boolean published = eventPublisher.publish(schedule);
+                ctx.json(new ScheduleResponse(schedule, published));
             } catch (DownstreamUnavailableException exception) {
                 serviceUnavailable(ctx, exception.service());
             }
@@ -64,6 +74,27 @@ public class StaffingServiceApp {
                 roles.add("Code Blue support physician");
             }
             return new Schedule(ward.wardId(), ward.department(), alertLevel, roles.size(), List.copyOf(roles));
+        }
+    }
+
+    public record ScheduleResponse(Schedule schedule, boolean staffingEventPublished) { }
+
+    private static final class StaffingEventPublisher {
+        private final ObjectMapper objectMapper = new ObjectMapper();
+
+        private boolean publish(Schedule schedule) {
+            ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(MqConfig.BROKER_URL);
+            try (Connection connection = factory.createConnection();
+                 Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+                 MessageProducer producer = session.createProducer(session.createTopic(MqConfig.TOPIC))) {
+                producer.setDeliveryMode(DeliveryMode.PERSISTENT);
+                TextMessage message = session.createTextMessage(objectMapper.writeValueAsString(schedule));
+                producer.send(message);
+                return true;
+            } catch (Exception exception) {
+                System.err.println("Unable to publish staffing event: " + exception.getMessage());
+                return false;
+            }
         }
     }
 

@@ -10,6 +10,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -17,8 +18,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.jms.Connection;
+import javax.jms.DeliveryMode;
 import javax.jms.Message;
 import javax.jms.MessageConsumer;
+import javax.jms.MessageProducer;
 import javax.jms.Session;
 import javax.jms.TextMessage;
 import org.apache.activemq.ActiveMQConnectionFactory;
@@ -31,6 +34,7 @@ public class WardServiceApp {
                 System.getenv().getOrDefault("INGESTION_SERVICE_URL", DEFAULT_INGESTION_URL));
         StaffingEventSubscriber staffingEvents = new StaffingEventSubscriber();
         staffingEvents.start();
+        EquipmentFailurePublisher equipmentFailures = new EquipmentFailurePublisher();
         Javalin app = Javalin.create().start(7031);
 
         app.get("/health", ctx -> ctx.result("OK"));
@@ -74,10 +78,43 @@ public class WardServiceApp {
             }
             ctx.json(event);
         });
+        app.post("/wards/{id}/equipment-failures", ctx -> {
+            EquipmentFailureRequest request;
+            try {
+                request = ctx.bodyAsClass(EquipmentFailureRequest.class);
+            } catch (RuntimeException exception) {
+                ctx.status(400).json(new ErrorResponse("Request body must include an equipment name"));
+                return;
+            }
+            if (request == null || request.equipment() == null || request.equipment().isBlank()) {
+                ctx.status(400).json(new ErrorResponse("equipment is required"));
+                return;
+            }
+            try {
+                WardRecord ward = directory.ward(ctx.pathParam("id"));
+                if (ward == null) {
+                    ctx.status(404).json(new ErrorResponse("Ward not found: " + ctx.pathParam("id")));
+                    return;
+                }
+                EquipmentFailure failure = new EquipmentFailure(ward.wardId(), ward.department(),
+                        request.equipment().trim(), blankToNull(request.details()), Instant.now().toString());
+                if (!equipmentFailures.publish(failure)) {
+                    ctx.status(503).json(new ErrorResponse("Equipment-alert queue is unavailable"));
+                    return;
+                }
+                ctx.status(202).json(failure);
+            } catch (DownstreamUnavailableException exception) {
+                unavailable(ctx, exception);
+            }
+        });
     }
 
     private static void unavailable(io.javalin.http.Context ctx, DownstreamUnavailableException exception) {
         ctx.status(503).json(new ErrorResponse("Ingestion service is unavailable"));
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value.trim();
     }
 
     private record ErrorResponse(String error) { }
@@ -147,6 +184,29 @@ public class WardServiceApp {
 
     private record StaffingEvent(String wardId, String department, int alertLevel,
                                  int requiredDoctors, List<String> onCallRoles) { }
+
+    public record EquipmentFailureRequest(String equipment, String details) { }
+
+    public record EquipmentFailure(String wardId, String department, String equipment,
+                                   String details, String reportedAt) { }
+
+    private static final class EquipmentFailurePublisher {
+        private final ObjectMapper objectMapper = new ObjectMapper();
+
+        private boolean publish(EquipmentFailure failure) {
+            ActiveMQConnectionFactory factory = new ActiveMQConnectionFactory(MqConfig.BROKER_URL);
+            try (Connection connection = factory.createConnection();
+                 Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
+                 MessageProducer producer = session.createProducer(session.createQueue(MqConfig.QUEUE))) {
+                producer.setDeliveryMode(DeliveryMode.PERSISTENT);
+                producer.send(session.createTextMessage(objectMapper.writeValueAsString(failure)));
+                return true;
+            } catch (Exception exception) {
+                System.err.println("Unable to publish equipment failure: " + exception.getMessage());
+                return false;
+            }
+        }
+    }
 
     private static final class StaffingEventSubscriber {
         private final AtomicReference<StaffingEvent> latest = new AtomicReference<>();

@@ -80,12 +80,19 @@ mvn package
 java -jar target/ingestion-service.jar
 ```
 
-Listens on port `7030`. Currently just exposes `/health` — the actual CSV
-parsing/cleaning logic is a TODO.
+Listens on port `7030`. `GET /wards` returns normalized, de-duplicated records;
+`GET /wards/{id}` returns one record or `404`. Invalid values are represented as
+`null` and described in the record's `notes` field.
 
 ## Test
 
-No automated tests yet. Manually verify it's up:
+Run the CSV cleanup regression tests:
+
+```
+mvn test
+```
+
+Or manually verify the running service:
 
 ```
 curl http://localhost:7030/health   # -> OK

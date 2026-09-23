@@ -53,12 +53,7 @@ from their own directories at the project root).
 docker compose ps          # confirm the broker container is healthy
 ```
 
-Once the TODOs below are implemented, verify end-to-end by publishing a message from
-`staffing-service` and confirming the consumer(s) receive it — e.g. via logs, or by
-watching the topic in the web console.
-
-## TODO
-
-- Add `activemq-client` publish logic to `staffing-service` on its stage/state-change endpoint.
-- Add `activemq-client` subscriber logic to consumer service(s) above, replacing any
-  direct synchronous calls to `staffing-service`.
+Verify end-to-end by requesting a schedule from `staffing-service` and then reading
+`GET /staffing-events/latest` from `ward-service`. The producer publishes persistent
+topic messages; ward-service uses a durable subscription so it can receive messages
+that arrived while it was offline.

@@ -28,13 +28,13 @@ cleanup through synchronous REST calls to asynchronous MQ decoupling and alertin
 Plus [`common/`](common) (no port) — the shared ActiveMQ broker and MQ config notes
 for `staffing-events-topic`: Staffing updates are broadcast as Events via the broker to decouple the frontend from the Staffing Service.
 
-**Status:** scaffold only — build files, Javalin bootstrap, and TODOs are in place; no
-business logic has been implemented yet.
+**Status:** complete reference implementation. The required ingestion and REST
+stages are implemented, along with the optional ActiveMQ topic and queue stages.
 
 ## Your task
 
-Each stage below builds on the last — do them in order. Every service already builds
-and runs (`/health` returns `OK`); your job is to fill in the `TODO`s.
+Each stage below builds on the last. Every service exposes `/health` and its domain
+endpoints documented below.
 
 1. **Ingestion** (required) — in `IngestionServiceApp`, read and clean
    `wards-outdated.csv` (see [ingestion-service/README.md](ingestion-service/README.md)
@@ -61,7 +61,7 @@ on 3-4 — a complete core beats a half-done everything.
 Automated tests aren't required, but are a good way to show your work — see each
 service's `## Test` section for how to add JUnit 5.
 
-## Integration contracts
+## API and integration contracts
 
 Endpoint shapes below are illustrative, not a fixed spec to match byte-for-byte —
 reasonable field names/status codes are fine as long as the calling service can
@@ -75,6 +75,24 @@ consume them.
 | `staffing-service` | `ward-service` (topic, stage 3) | publish to `staffing-events-topic` | Broadcast a schedule/status change |
 | `ward-service` (topic, stage 3) | — | subscribe to `staffing-events-topic` | React to staffing updates without polling |
 | `ward-service` (queue, stage 4) | `equipment-alert-service` | publish to `equipment-failure-queue` | Guarantee delivery of an equipment failure alert |
+
+| Service | Endpoint | Purpose |
+|---|---|---|
+| ingestion | `GET /wards`, `GET /wards/{id}` | Cleaned, de-duplicated ward data. Invalid source values are `null` and explained in `notes`. |
+| ward | `GET /wards`, `GET /wards/{id}`, `GET /departments` | Ingestion-backed ward directory. |
+| alert level | `GET /alert-level`, `PUT /alert-level` | Reads or updates the status. Update with `{"level": 0}` through `{"level": 8}`. |
+| staffing | `GET /staffing-schedule/{wardId}` | Validates the ward, reads alert level, and computes on-call roles. |
+| ward | `GET /staffing-events/latest` | Last asynchronously received staffing event; `204` before one arrives. |
+| ward | `POST /wards/{id}/equipment-failures` | Queues a failure such as `{"equipment":"Ventilator","details":"pressure leak"}`. |
+| equipment alert | `GET /equipment-alerts` | Persisted, processed equipment alerts. |
+
+The three HTTP clients use short connection/request timeouts and return `503` when a
+dependency is unavailable. Service base URLs can be overridden with
+`INGESTION_SERVICE_URL`, `WARD_SERVICE_URL`, and `ALERT_LEVEL_SERVICE_URL`.
+
+The staffing topic uses durable, persistent messages. The equipment queue uses
+persistent delivery and client acknowledgement only after the alert is appended to
+`equipment-alerts.log`, providing at-least-once processing.
 
 ## Project structure
 
@@ -147,34 +165,16 @@ cd equipment-alert-service && mvn package && java -jar target/equipment-alert-se
 
 ## Test
 
-No automated tests exist yet (this is a scaffold). Each running service exposes
-`/health`, so sanity-check manually:
+Regression tests cover ingestion cleanup/deduplication and staffing escalation
+rules. Run them from their module directories:
+
+```
+cd ingestion-service && mvn test
+cd staffing-service && mvn test
+```
+
+Each running service also exposes `/health`, so sanity-check manually:
 
 ```
 curl http://localhost:7030/health   # -> OK
-```
-
-To add real tests to a module, add JUnit 5 and Surefire to its `pom.xml`:
-
-```xml
-<dependency>
-  <groupId>org.junit.jupiter</groupId>
-  <artifactId>junit-jupiter</artifactId>
-  <version>5.10.2</version>
-  <scope>test</scope>
-</dependency>
-```
-
-```xml
-<plugin>
-  <groupId>org.apache.maven.plugins</groupId>
-  <artifactId>maven-surefire-plugin</artifactId>
-  <version>3.2.5</version>
-</plugin>
-```
-
-then add tests under that module's `src/test/java/...` and run:
-
-```
-mvn test
 ```
